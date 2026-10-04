@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>招聘背调授权与结果封存系统</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="vendor/vue.global.prod.js"></script>
+</head>
+<body>
+<div id="app">
+  <!-- ============================ 顶栏 ============================ -->
+  <header class="topbar">
+    <div class="brand">🛡️ 招聘背调授权与结果封存系统</div>
+    <div class="top-actions">
+      <div class="role-badge" :class="'role-' + me.role">{{ roleLabel(me.role) }}</div>
+      <button class="btn btn-ghost" @click="openNotifications">🔔 通知
+        <span class="dot" v-if="unreadCount">{{ unreadCount }}</span>
+      </button>
+      <select v-model.number="userId" @change="switchUser" class="user-select">
+        <option v-for="u in users" :key="u.id" :value="u.id">
+          {{ u.display_name }}（{{ roleLabel(u.role) }}）
+        </option>
+      </select>
+    </div>
+  </header>
+
+  <!-- ============================ 候选人 ============================ -->
+  <main v-if="me.role === 'candidate'">
+    <section class="panel">
+      <h2>我的背调授权</h2>
+      <p class="hint">授权书载明：调查项目、结果可见人、授权期限。您可随时撤回授权；撤回后不能发起新查询，已有结果将被封存。</p>
+      <div v-if="!consents.length" class="empty">暂无授权</div>
+      <div class="card" v-for="c in consents" :key="c.id" :class="{sealed: c.status !== 'granted'}">
+        <div class="card-head">
+          <div><b>{{ c.code }}</b> · {{ c.position }} <span :class="'st st-'+c.status">{{ statusLabel(c.status) }}</span></div>
+          <div class="muted">招聘专员：{{ c.recruiter.display_name }}</div>
+        </div>
+        <div class="kv">
+          <div><span>调查项目</span><b>{{ c.approved_item_labels.join('、') }}</b></div>
+          <div><span>结果可见人</span><b>{{ c.viewers.map(v=>v.display_name).join('、') || '—' }}</b></div>
+          <div><span>授权时间</span><b>{{ fmt(c.granted_at) }}</b></div>
+          <div><span>到期时间</span><b :class="{danger: !c.active}">{{ fmt(c.expires_at) }}</b></div>
+          <div v-if="c.withdrawn_at"><span>撤回时间</span><b>{{ fmt(c.withdrawn_at) }}（{{ c.withdraw_reason }}）</b></div>
+          <div v-if="c.cancelled_at"><span>岗位取消</span><b>{{ fmt(c.cancelled_at) }}（{{ c.cancel_reason }}）</b></div>
+        </div>
+        <div class="card-actions">
+          <button class="btn" @click="loadChecks()">查看相关背调</button>
+          <button class="btn btn-danger" v-if="c.status==='granted'" @click="withdraw(c)">撤回授权</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>我的背调结果</h2>
+      <check-table :checks="checks" :me="me" :can-view-full-id="x=>false"
+                   @result="openResult" @timeline="openTimeline"></check-table>
+    </section>
+
+    <section class="panel">
+      <h2>我的更正申请</h2>
+      <table class="tbl" v-if="corrections.length">
+        <tr><th>背调单</th><th>字段</th><th>主张内容</th><th>状态</th><th>处理人</th><th>说明</th></tr>
+        <tr v-for="r in corrections" :key="r.id">
+          <td>{{ r.check_code }}</td><td>{{ fieldLabel(r.field_path) }}</td><td>{{ r.claimed_value }}</td>
+          <td><span :class="'st st-'+r.status">{{ corrLabel(r.status) }}</span></td>
+          <td>{{ r.handled_by ? r.handled_by.display_name : '—' }}</td><td>{{ r.decision_note }}</td>
+        </tr>
+      </table>
+      <div v-else class="empty">暂无更正申请</div>
+    </section>
+  </main>
+
+  <!-- ============================ 招聘专员 ============================ -->
+  <main v-else-if="me.role === 'recruiter'">
+    <section class="panel">
+      <h2>操作</h2>
+      <div class="btn-row">
+        <button class="btn btn-primary" @click="openConsentForm">① 拟定候选人授权</button>
+        <button class="btn" @click="refreshAll">刷新数据</button>
+      </div>
+      <p class="hint">授权经候选人同意后生效；发起背调时只能选择授权已批准的调查项目——超范围项目在系统层面直接拦截。</p>
+    </section>
+
+    <section class="panel">
+      <h2>授权列表</h2>
+      <div v-if="!consents.length" class="empty">暂无授权</div>
+      <div class="card" v-for="c in consents" :key="c.id" :class="{sealed: c.status!=='granted'}">
+        <div class="card-head">
+          <div><b>{{ c.code }}</b> · {{ c.candidate.display_name }} · {{ c.position }}
+            <span :class="'st st-'+c.status">{{ statusLabel(c.status) }}</span></div>
+          <div class="muted">到期：{{ fmt(c.expires_at) }}｜可见人：{{ c.viewers.map(v=>v.display_name).join('、') }}</div>
+        </div>
+        <div class="kv"><div><span>调查项目</span><b>{{ c.approved_item_labels.join('、') }}</b></div></div>
+        <div class="card-actions">
+          <button class="btn btn-primary" :disabled="!c.active" @click="openInitiate(c)">
+            ② 发起背调
+          </button>
+          <button class="btn btn-danger-outline" :disabled="c.status!=='granted'" @click="cancelPosition(c)">
+            取消岗位并封存
+          </button>
+        </div>
+        <div v-if="!c.active && c.status==='granted'" class="warn">授权已到期，不能发起新查询</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>我发起的背调</h2>
+      <check-table :checks="checks" :me="me" :can-view-full-id="canViewFullId"
+                   @result="openResult" @timeline="openTimeline"></check-table>
+    </section>
+  </main>
+
+  <!-- ============================ 机构 ============================ -->
+  <main v-else-if="me.role === 'agency'">
+    <section class="panel">
+      <h2>待回传背调任务</h2>
+      <p class="hint">仅可回传分配给本机构的背调单。同一背调单重复回传将被登记为“重复回传”，不会覆盖原始结果。</p>
+      <table class="tbl" v-if="checks.length">
+        <tr><th>背调单号</th><th>候选人</th><th>岗位</th><th>调查项目</th><th>状态</th><th>回传</th></tr>
+        <tr v-for="c in checks" :key="c.id">
+          <td>{{ c.code }}</td><td>{{ c.candidate_name }}</td><td>{{ c.position }}</td>
+          <td>{{ c.requested_item_labels.join('、') }}</td>
+          <td><span :class="'st st-'+c.status">{{ checkStatusLabel(c.status) }}</span>
+            <span v-if="c.duplicate_count" class="tag">重复×{{ c.duplicate_count }}</span></td>
+          <td>
+            <button class="btn btn-primary" :disabled="c.status==='sealed'" @click="openSubmit(c)">
+              {{ c.has_result ? '再次回传（将记为重复）' : '回传结果' }}
+            </button>
+          </td>
+        </tr>
+      </table>
+      <div v-else class="empty">暂无任务</div>
+    </section>
+  </main>
+
+  <!-- ============================ 合规 ============================ -->
+  <main v-else-if="me.role === 'compliance'">
+    <section class="panel">
+      <h2>合规工作台</h2>
+      <div class="btn-row">
+        <button class="btn" @click="showTab='audit'">背调审计（脱敏/完整/原始回执）</button>
+        <button class="btn" :class="{'btn-warn': pendingAnomalies.length}" @click="showTab='anomaly'">
+          异常处理 <span v-if="pendingAnomalies.length" class="dot">{{ pendingAnomalies.length }}</span>
+        </button>
+        <button class="btn" :class="{'btn-warn': pendingCorrections.length}" @click="showTab='correction'">
+          更正处理 <span v-if="pendingCorrections.length" class="dot">{{ pendingCorrections.length }}</span>
+        </button>
+        <button class="btn" @click="showTab='logs'">访问记录</button>
+      </div>
+    </section>
+
+    <section class="panel" v-if="showTab==='audit'">
+      <h2>全部背调（审计视图）</h2>
+      <check-table :checks="checks" :me="me" :can-view-full-id="()=>true"
+                   @result="openResult" @timeline="openTimeline"></check-table>
+    </section>
+
+    <section class="panel" v-if="showTab==='anomaly'">
+      <h2>异常结论处理</h2>
+      <p class="hint">提交人不能批准自己登记的异常结论；批准/驳回均需填写处理意见与依据。</p>
+      <div class="card" v-for="a in anomalies" :key="a.id">
+        <div class="card-head">
+          <div><b>{{ a.title }}</b> · {{ a.check_code }} · {{ a.candidate_name }}
+            <span :class="'st st-'+a.status">{{ anomalyLabel(a.status) }}</span></div>
+          <div class="muted">提交人：{{ a.raised_by.display_name }} ｜ 批准人：{{ a.approver ? a.approver.display_name : '—' }}</div>
+        </div>
+        <div class="kv">
+          <div><span>结论</span><b>{{ a.conclusion }}</b></div>
+          <div><span>依据</span><b>{{ a.basis || '—' }}</b></div>
+          <div v-if="a.evidence_ref"><span>证据索引</span><b>{{ a.evidence_ref }}</b></div>
+          <div v-if="a.resolution"><span>处理结果</span><b>{{ a.resolution }}</b></div>
+          <div v-if="a.decision_note"><span>审批意见</span><b>{{ a.decision_note }}</b></div>
+        </div>
+        <div class="card-actions" v-if="a.status==='pending'">
+          <button class="btn btn-danger" :disabled="a.raised_by.id===me.id"
+                  :title="a.raised_by.id===me.id ? '提交人不能批准自己的结论（回避）' : ''"
+                  @click="decideAnomaly(a, true)">批准</button>
+          <button class="btn" :disabled="a.raised_by.id===me.id" @click="decideAnomaly(a, false)">驳回</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" v-if="showTab==='correction'">
+      <h2>候选人更正申请</h2>
+      <div class="card" v-for="r in corrections" :key="r.id">
+        <div class="card-head">
+          <div><b>{{ r.check_code }}</b> · 字段 {{ fieldLabel(r.field_path) }}
+            <span :class="'st st-'+r.status">{{ corrLabel(r.status) }}</span></div>
+          <div class="muted">申请人：{{ r.candidate.display_name }}</div>
+        </div>
+        <div class="kv">
+          <div><span>主张内容</span><b>{{ r.claimed_value }}</b></div>
+          <div><span>理由</span><b>{{ r.reason }}</b></div>
+        </div>
+        <div class="card-actions" v-if="r.status==='pending'">
+          <button class="btn btn-primary" @click="decideCorrection(r, true)">核实后批准更正</button>
+          <button class="btn" @click="decideCorrection(r, false)">驳回</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" v-if="showTab==='logs'">
+      <h2>敏感材料访问记录</h2>
+      <table class="tbl">
+        <tr><th>时间</th><th>访问人</th><th>背调单</th><th>对象</th><th>结果</th><th>脱敏字段/原因</th></tr>
+        <tr v-for="l in accessLogs" :key="l.id">
+          <td>{{ fmt(l.created_at) }}</td><td>{{ l.user.display_name }}</td><td>{{ l.check_code }}</td>
+          <td>{{ targetLabel(l.target) }}</td>
+          <td><span :class="l.granted ? 'st st-approved' : 'st st-rejected'">
+            {{ l.granted ? '允许' : '拒绝（' + l.denied_reason + '）' }}</span></td>
+          <td>{{ (l.masked_fields||[]).map(fieldLabel).join('、') || l.reason }}</td>
+        </tr>
+      </table>
+      <div v-if="!accessLogs.length" class="empty">暂无访问记录</div>
+    </section>
+  </main>
+
+  <!-- ============================ 弹窗：新建授权 ============================ -->
+  <modal v-if="forms.consent" @close="forms.consent=null">
+    <h3>拟定背调授权（候选人同意后生效）</h3>
+    <label>候选人
+      <select v-model.number="forms.consent.candidate_id">
+        <option v-for="u in candidateUsers" :key="u.id" :value="u.id">{{ u.display_name }}</option>
+      </select>
+    </label>
+    <label>岗位名称 <input v-model="forms.consent.position" placeholder="如：高级后端工程师" /></label>
+    <fieldset>
+      <legend>调查项目（候选人勾选授权范围）</legend>
+      <label class="chk" v-for="(it, key) in catalog" :key="key">
+        <input type="checkbox" :value="key" v-model="forms.consent.approved_items" />
+        {{ it.label }}
+      </label>
+    </fieldset>
+    <fieldset>
+      <legend>结果可见人（可查看完整敏感材料的人）</legend>
+      <label class="chk" v-for="u in staffUsers" :key="u.id">
+        <input type="checkbox" :value="u.id" v-model="forms.consent.viewer_ids" />
+        {{ u.display_name }}
+      </label>
+    </fieldset>
+    <label>授权有效天数 <input type="number" v-model.number="forms.consent.valid_days" min="1" /></label>
+    <label>授权书文本（向候选人出示）
+      <textarea v-model="forms.consent.consent_text" rows="3">
+本人已被明确告知调查项目、结果可见范围及授权期限，并同意在上述范围内开展背景调查。</textarea>
+    </label>
+    <div class="modal-actions">
+      <button class="btn btn-primary" @click="submitConsent">候选人已同意，生成授权</button>
+      <button class="btn" @click="forms.consent=null">取消</button>
+    </div>
+  </modal>
+
+  <!-- ============================ 弹窗：发起背调 ============================ -->
+  <modal v-if="forms.initiate" @close="forms.initiate=null">
+    <h3>发起背景调查 · {{ forms.initiate.code }}</h3>
+    <p class="hint">候选人：{{ forms.initiate.candidate.display_name }} ｜ 岗位：{{ forms.initiate.position }}</p>
+    <label>承办机构
+      <select v-model.number="forms.initiate.agency_id">
+        <option v-for="a in agencies" :key="a.id" :value="a.id">{{ a.name }}</option>
+      </select>
+    </label>
+    <fieldset>
+      <legend>本次调查项目（只能在授权范围内勾选）</legend>
+      <label class="chk" v-for="key in forms.initiate.approved_items" :key="key">
+        <input type="checkbox" :value="key" v-model="forms.initiate.requested_items" />
+        {{ catalog[key].label }}
+      </label>
+    </fieldset>
+    <div class="warn" v-if="initiateScopeError">⚠ {{ initiateScopeError }}</div>
+    <p class="muted">尝试加入授权范围外项目可观察后端拦截（本界面不提供越权选项，超范围由后端强制校验）。</p>
+    <div class="modal-actions">
+      <button class="btn btn-primary" @click="submitInitiate">下发背调单</button>
+      <button class="btn" @click="forms.initiate=null">取消</button>
+    </div>
+  </modal>
+
+  <!-- ============================ 弹窗：机构回传 ============================ -->
+  <modal v-if="forms.submit" @close="forms.submit=null" wide>
+    <h3>回调查结果 · {{ forms.submit.check.code }}</h3>
+    <p class="hint">调查项目：{{ forms.submit.check.requested_item_labels.join('、') }}。敏感字段请如实填写，系统按查看权限自动脱敏。</p>
+    <button class="btn" @click="fillSample" style="margin-bottom:8px">⚡ 填充模拟数据（演示用）</button>
+    <div v-for="key in forms.submit.check.requested_items" :key="key" class="result-item">
+      <h4>{{ catalog[key].label }}</h4>
+      <label v-for="(f, fkey) in catalog[key].fields" :key="fkey">
+        {{ f.label }}
+        <span class="lvl" :class="'lvl-'+f.level">{{ f.level === 'sensitive' ? '敏感' : '招聘相关' }}</span>
+        <input v-model="forms.submit.payload[key][fkey]" :placeholder="f.label" />
+      </label>
+    </div>
+    <label>机构原始回执（仅合规人员可查看，留痕）
+      <textarea v-model="forms.submit.raw_receipt" rows="3"
+                placeholder="如：【鼎信背调】原始回执编号 RC-2026-0007 ……"></textarea>
+    </label>
+    <div class="modal-actions">
+      <button class="btn btn-primary" @click="submitResult">提交回传</button>
+      <button class="btn" @click="forms.submit=null">取消</button>
+    </div>
+  </modal>
+
+  <!-- ============================ 弹窗：结果查看（三级权限） ============================ -->
+  <modal v-if="forms.result" @close="forms.result=null" wide>
+    <h3>背调结果 · {{ forms.result.check.code }}
+      <span v-if="resultData && resultData.sealed" class="st st-sealed">已封存：{{ resultData.seal_reason }}</span>
+    </h3>
+    <div class="seg">
+      <button :class="{on: resultView==='masked'}" @click="loadResult('masked')">脱敏结果</button>
+      <button :class="{on: resultView==='full'}" @click="loadResult('full')">完整材料（敏感字段明文）</button>
+      <button :class="{on: resultView==='raw'}" @click="loadResult('raw')">机构原始回执</button>
+    </div>
+
+    <div v-if="resultError" class="error-box">⛔ {{ resultError }}
+      <div class="muted">本次拒绝访问已写入访问记录。</div>
+    </div>
+
+    <template v-if="resultData">
+      <!-- 脱敏 / 完整 -->
+      <template v-if="resultView !== 'raw'">
+        <div v-if="resultData.masked_fields.length" class="warn">
+          已隐藏 {{ resultData.masked_fields.length }} 个与招聘无关的敏感字段：
+          {{ resultData.masked_fields.map(fieldLabel).join('、') }}
+        </div>
+        <div v-else-if="resultView==='full'" class="ok-box">完整材料视图：敏感字段明文展示，本次访问已留痕。</div>
+        <table class="tbl" v-for="(item, key) in resultData.payload" :key="key">
+          <tr><th colspan="2">{{ catalog[key] ? catalog[key].label : key }}</th></tr>
+          <tr v-for="(v, fk) in item" :key="fk">
+            <td class="fname">{{ catalog[key].fields[fk] ? catalog[key].fields[fk].label : fk }}
+              <span v-if="catalog[key].fields[fk] && catalog[key].fields[fk].level==='sensitive'"
+                    class="tag tag-sens">敏感</span></td>
+            <td :class="{masked: v==='******'}">{{ v }}</td>
+          </tr>
+        </table>
+        <div v-if="resultData.amendments.length" class="amend-box">
+          📝 已应用 {{ resultData.amendments.length }} 条候选人更正（原件保留）：
+          <span v-for="a in resultData.amendments" :key="a.field_path">
+            【{{ fieldLabel(a.field_path) }}：{{ a.old_value }} → {{ a.new_value }}】
+          </span>
+        </div>
+        <div v-if="resultData.duplicates.length" class="warn">
+          存在 {{ resultData.duplicates.length }} 次机构重复回传，原始结果未被覆盖（见时间线）。
+        </div>
+      </template>
+      <!-- 原始回执 -->
+      <template v-else>
+        <div class="ok-box">您正在查看机构原始回执，系统已记录本次访问（访问人、时间、对象）。</div>
+        <pre class="raw-box">{{ resultData.raw_receipt }}</pre>
+      </template>
+    </template>
+
+    <div class="modal-actions">
+      <button class="btn" @click="openTimeline(forms.result.check)">查看调查与处理时间线</button>
+      <button class="btn btn-primary" v-if="me.role==='candidate'" @click="openCorrection(forms.result.check)">申请更正结果</button>
+      <button class="btn btn-warn" v-if="me.role==='recruiter' || me.role==='compliance'"
+              @click="openAnomaly(forms.result.check)">登记异常结论</button>
+      <button class="btn" @click="forms.result=null">关闭</button>
+    </div>
+  </modal>
+
+  <!-- ============================ 弹窗：登记异常 ============================ -->
+  <modal v-if="forms.anomaly" @close="forms.anomaly=null">
+    <h3>登记异常结论 · {{ forms.anomaly.code }}</h3>
+    <label>异常标题 <input v-model="forms.anomaly.title" /></label>
+    <label>结论 <textarea v-model="forms.anomaly.conclusion" rows="2"></textarea></label>
+    <label>认定依据（必填，随处理记录长期保留） <textarea v-model="forms.anomaly.basis" rows="3"></textarea></label>
+    <label>证据索引 <input v-model="forms.anomaly.evidence_ref" placeholder="如：内部卷宗 DOC-2026-0331" /></label>
+    <p class="warn">提交后须由<b>另一名合规人员</b>批准；招聘专员无权批准，提交人本人亦不能批准。</p>
+    <div class="modal-actions">
+      <button class="btn btn-primary" @click="submitAnomaly">提交异常结论</button>
+      <button class="btn" @click="forms.anomaly=null">取消</button>
+    </div>
+  </modal>
+
+  <!-- ============================ 弹窗：更正申请 ============================ -->
+  <modal v-if="forms.correction" @close="forms.correction=null">
+    <h3>申请结果更正 · {{ forms.correction.check.code }}</h3>
+    <label>选择字段
+      <select v-model="forms.correction.field_path">
+        <template v-for="key in forms.correction.check.requested_items" :key="key">
+          <option v-for="(f, fk) in catalog[key].fields" :key="fk" :value="key+'.'+fk">
+            {{ catalog[key].label }} / {{ f.label }}
+          </option>
+        </template>
+      </select>
+    </label>
+    <label>我主张的正确内容 <input v-model="forms.correction.claimed_value" /></label>
+    <label>理由 / 证明材料说明 <textarea v-model="forms.correction.reason" rows="3"></textarea></label>
+    <div class="modal-actions">
+      <button class="btn btn-primary" @click="submitCorrection">提交更正申请</button>
+      <button class="btn" @click="forms.correction=null">取消</button>
+    </div>
+  </modal>
+
+  <!-- ============================ 弹窗：时间线 ============================ -->
+  <modal v-if="forms.timeline" @close="forms.timeline=null" wide>
+    <h3>调查与处理时间线 · {{ forms.timeline.code }}</h3>
+    <ul class="timeline">
+      <li v-for="e in timeline" :key="e.id">
+        <div class="t-dot" :class="'t-'+e.type"></div>
+        <div class="t-body">
+          <div><b>{{ timelineLabel(e.type) }}</b>
+            <span class="muted">{{ fmt(e.created_at) }} ｜ {{ e.actor ? e.actor.display_name : '系统' }}</span></div>
+          <div class="t-detail">{{ detailText(e) }}</div>
+        </div>
+      </li>
+    </ul>
+    <div class="modal-actions"><button class="btn" @click="forms.timeline=null">关闭</button></div>
+  </modal>
+
+  <!-- ============================ 弹窗：通知 ============================ -->
+  <modal v-if="forms.notif" @close="forms.notif=false">
+    <h3>通知（本地模拟）</h3>
+    <div v-for="n in notifications" :key="n.id" class="notif" :class="{unread: !n.read}">
+      <b>{{ n.title }}</b>
+      <div>{{ n.content }}</div>
+      <div class="muted">{{ n.channel }} · {{ fmt(n.created_at) }}</div>
+    </div>
+    <div v-if="!notifications.length" class="empty">暂无通知</div>
+  </modal>
+
+  <div class="toast" v-if="toast" :class="toast.kind">{{ toast.text }}</div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
